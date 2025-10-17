@@ -1,0 +1,4 @@
+trained on	Thu Jun 11 13:32:00 2020
+package   	mhcflurry 1.7.0
+hostname  	lc01a11
+user      	odonnt02
