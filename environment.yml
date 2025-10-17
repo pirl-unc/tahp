@@ -1,0 +1,22 @@
+name: tahp
+channels:
+  - bioconda
+  - r
+  - conda-forge
+dependencies:
+  - bioconda::csvtk
+  - bioconda::mhcflurry
+  - bioconda::r-scevan
+  - bioconda::seqkit
+  - conda-forge::numpy
+  - conda-forge::r-ggplot2
+  - conda-forge::r-igraph
+  - conda-forge::r-scales
+  - python=3.10
+  - r::r-statgraph
+  - conda-forge::biopython
+  - conda-forge::pyvcf
+  - bioconda::pysam
+  - conda-forge::seaborn
+  - bioconda::snpeff=4.3.1t
+  - bioconda::snpsift
