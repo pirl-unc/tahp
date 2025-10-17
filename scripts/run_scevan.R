@@ -1,0 +1,6 @@
+library(SCEVAN)       
+args <- commandArgs(trailingOnly=TRUE)                                
+input_mtx <- read.csv(args[1], sep='\t', header=TRUE, row.names=1)
+head(input_mtx)
+results <- pipelineCNA(input_mtx)
+write.table(results, paste0("intermediates/", args[2], ".scevan_results.tsv"), sep = '\t', quote = FALSE)

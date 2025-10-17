@@ -1,0 +1,217 @@
+#!/bin/bash
+
+cta_gene_list="refs/cta.pirlygenes.gene_list"
+expression_threshold=1
+cell_abundance=10
+mhcflurry_pres=0.9
+mhcflurry_ba=50
+samp_id="tahp_sample"
+fresh_flag=false
+
+while getopts "f:s:h:p:b:g:v:e:c:a:o:h" opt; do
+  case $opt in
+    f) fresh_flag=true ;;
+    s) samp_id="$OPTARG" ;;
+    h) hla_alleles="$OPTARG" ;;
+    p) mhcflurry_pres="$OPTARG" ;;
+    b) mhcflurry_ba="$OPTARG" ;;
+    g) gene_matrix="$OPTARG" ;;
+    v) vcf="$OPTARG" ;;
+    e) expression_threshold="$OPTARG" ;;
+    c) cta_gene_list="$OPTARG" ;;
+    a) cell_abundance="$OPTARG" ;;
+    o) output_file="$OPTARG" ;;
+    h) echo "Usage: $0 -f input -o output"; exit 0 ;;
+    \?) echo "Invalid option: -$OPTARG" >&2; exit 1 ;;
+  esac
+done
+
+for dir in intermediates plots logs outputs; do
+    mkdir -p $dir
+done
+
+
+if [ "$FRESH_FLAG" = true ]; then
+    echo "The -f flag was used, so clearing directories before running..."
+    for dir in intermediates plots logs outputs; do
+        mkdir -p $dir
+        rm -rf $dir/$samp_id*
+    done
+fi
+
+if [ ! -f intermediates/$samp_id.scevan_results.tsv ]; then
+    echo "Running SCEVAN to categorize tumor cells..."
+    # Get list of canonical genes that can be used for SCEVAN.
+    cut -f 7 ${gene_matrix} | sort | uniq -c | grep -v ' 1 ' | rev | cut -f 1 -d ' ' | rev  | grep -v "^0$" > intermediates/$samp_id.gene_black_list
+    awk '$7 != 0' ${gene_matrix} | grep -v -f intermediates/$samp_id.gene_black_list | cut -f 7- > intermediates/$samp_id.input.white_list.tsv
+    Rscript scripts/run_scevan.R intermediates/$samp_id.input.white_list.tsv $samp_id > logs/$samp_id.scevan.log 2>&1
+    mv output intermediates/$samp_id.scevan_outputs
+else
+   echo "SCEVAN results for $samp_id already found in intermediates directory."
+   echo "Skipping SCEVAN. Use -f flag to re-run from scratch."
+fi
+
+grep "tumor" intermediates/$samp_id.scevan_results.tsv | cut -f 1 > intermediates/$samp_id.tumor_cell_barcodes
+
+echo "Filtering gene count matrix to CTAs and/or ERVs of interest..."
+head -1 $gene_matrix | sed 's/gene_name/gene_symbol/g' | cut -f 7- > intermediates/$samp_id.ctas_and_ervs.tsv
+grep -f <(cat $cta_gene_list | sed 's/^/	/g' | sed 's/$/	/g') $gene_matrix | cut -f 7- >> intermediates/$samp_id.ctas_and_ervs.tsv
+# Note this assumes gEVE database naming convention.
+grep "^Hsap" $gene_matrix | cut -f 1,8- >> intermediates/$samp_id.ctas_and_ervs.tsv
+
+
+echo "Filtering gene count matrix to tumor cells..."
+head -1 <(csvtk transpose -t intermediates/$samp_id.ctas_and_ervs.tsv) > intermediates/$samp_id.ctas_and_ervs.tumor_cells.t.tsv
+grep -f <(cat intermediates/$samp_id.tumor_cell_barcodes) <(csvtk transpose -t intermediates/$samp_id.ctas_and_ervs.tsv) >> intermediates/$samp_id.ctas_and_ervs.tumor_cells.t.tsv
+csvtk transpose -t intermediates/$samp_id.ctas_and_ervs.tumor_cells.t.tsv > intermediates/$samp_id.ctas_and_ervs.tumor_cells.tsv
+
+echo "Converting counts to binary value based on expression threshold..."
+#./tahp/scripts/counts_to_binary.sh $expression_threshold intermediates/*ctas_and_ervs.tumor_cells.tsv intermediates/$samp_id.ctas_and_ervs.tumor_cells.bin.tsv
+scripts/counts_to_binary.sh $expression_threshold intermediates/$samp_id.ctas_and_ervs.tumor_cells.tsv intermediates/$samp_id.ctas_and_ervs.tumor_cells.bin.tsv
+
+echo "Filtering gene count matrix to CTAs and/or ERVs present in $cell_abundance% or more cells..."
+#./tahp/scripts/filt_binary_to_abundant.sh $cell_abundance <(csvtk transpose -t intermediates/*ctas_and_ervs.bin.tsv) intermediates/$samp_id.ctas_and_ervs.bin.filtd.tsv $samp_id
+scripts/filt_binary_to_abundant.sh $cell_abundance <(csvtk transpose -t intermediates/$samp_id.ctas_and_ervs.tumor_cells.bin.tsv) intermediates/$samp_id.ctas_and_ervs.tumor_cells.bin.filtd.tsv $samp_id
+sed -i 's/gene_symbol/barcode/g' intermediates/$samp_id.ctas_and_ervs.tumor_cells.bin.filtd.tsv
+# Also using this opportunity to convert the gEVE ID to the gEVE MetID
+grep -f <(head -1 intermediates/$samp_id.ctas_and_ervs.tumor_cells.bin.filtd.tsv | sed 's/\t/\n/g' | grep ^Hsap38) refs/Hsap38.txt | cut -f 1,9 > intermediates/$samp_id.Hsap38.reduced_lookup.txt
+while read old new; do sed -i "s/${old}/${new}/g" intermediates/$samp_id.ctas_and_ervs.tumor_cells.bin.filtd.tsv; done < intermediates/$samp_id.Hsap38.reduced_lookup.txt
+
+echo "Processing VCF..."
+# Removing MNVs for now. Will need to address later.
+bcftools +fill-tags ${vcf} -- -t AF,F_MISSING | bcftools view -i 'AF<0.9 & F_MISSING<.5' | bcftools view -S intermediates/$samp_id.tumor_cell_barcodes | grep -v chrM | grep -v chrY | bcftools view -v snps> intermediates/$samp_id.somatic_vars.tumor_cells.vcf
+echo "Running snpEff for variant annotation..."
+snpEff -Xmx8g ann -c refs/GRCh38.GENCODEv37/snpEff.config -v GRCh38.GENCODEv37 intermediates/$samp_id.somatic_vars.tumor_cells.vcf -noShiftHgvs -dataDir ${PWD}/refs > intermediates/$samp_id.somatic_vars.tumor_cells.annot.vcf 2> logs/$samp_id.snpeff.log
+rm -f snpEff_*
+echo "Extracting missense variants..."
+SnpSift filter "ANN[*].EFFECT has 'missense_variant'" -f intermediates/$samp_id.somatic_vars.tumor_cells.annot.vcf > intermediates/$samp_id.somatic_vars.tumor_cells.sfilt.snvs.vcf
+echo "Extracting variant metadata..."
+grep ^chr intermediates/$samp_id.somatic_vars.tumor_cells.sfilt.snvs.vcf | cut -f 8 | sed -z 's/,/\n/g' | grep missense | cut -f 7 -d '|' | sort | uniq > intermediates/$samp_id.somatic_vars.tumor_cells.sfilt.snvs.somatic_txs
+echo "Generating mutant peptides..."
+zgrep -f intermediates/$samp_id.somatic_vars.tumor_cells.sfilt.snvs.somatic_txs refs/gencode.v37.annotation.with.hervs.gtf | grep '	CDS	' > intermediates/$samp_id.sub_gtf
+mkdir -p intermediates/$samp_id.tx_beds
+while read line; do
+   grep ${line} intermediates/$samp_id.sub_gtf | grep '	CDS	' | cut -f 1,4,5 >> intermediates/$samp_id.tx_beds/$samp_id.${line//'"'/}.bed;
+done < intermediates/$samp_id.somatic_vars.tumor_cells.sfilt.snvs.somatic_txs
+cut -f 1,2 intermediates/$samp_id.somatic_vars.tumor_cells.sfilt.snvs.vcf | grep -v "Cannot" | grep -v "^#" > intermediates/$samp_id.somatic_vars.tumor_cells.sfilt.snvs.voi_coords
+mkdir -p intermediates/$samp_id.all_vcfs
+while read line; do
+    CHROM=`echo ${line} | cut -f 1 -d ' '`;
+    POS=`echo ${line} | cut -f 2 -d ' '`;
+    LB=`expr ${POS} - 50`;
+    UB=`expr ${POS} + 50`;
+    FILTER_STR="CHROM=\"${CHROM}\" && POS=${POS}";
+    NO_HIT_FILTER_STR="CHROM=\"chr50\" && POS=1";
+    bcftools filter -i "${FILTER_STR}" intermediates/$samp_id.somatic_vars.tumor_cells.sfilt.snvs.vcf > intermediates/$samp_id.all_vcfs/${CHROM}_${POS}.tumor.vcf;
+    bcftools filter -i "${NO_HIT_FILTER_STR}" intermediates/$samp_id.somatic_vars.tumor_cells.sfilt.snvs.vcf > intermediates/$samp_id.all_vcfs/${CHROM}_${POS}.normal.vcf;
+done < intermediates/$samp_id.somatic_vars.tumor_cells.sfilt.snvs.voi_coords
+mkdir -p intermediates/$samp_id.exon_fas
+mkdir -p intermediates/$samp_id.tmp
+for i in `ls intermediates/$samp_id.tx_beds`; do
+    sed 's/	/:/' intermediates/$samp_id.tx_beds/${i} | sed 's/	/-/' > intermediates/$samp_id.tmp/${i%.bed}.samt.bed
+    if [ -s intermediates/$samp_id.tmp/${i%.bed}.samt.bed ]; then
+       samtools faidx -r intermediates/$samp_id.tmp/${i%.bed}.samt.bed  refs/Homo_sapiens.assembly38.fa > intermediates/$samp_id.exon_fas/${i%.bed}.exons.fa
+    fi
+done
+mkdir -p intermediates/$samp_id.all_vcfs.local
+for i in `ls intermediates/$samp_id.all_vcfs/*vcf`; do
+    OUT=`echo ${i} | rev | cut -f 1 -d '/' | rev`
+    bgzip -c ${i} > intermediates/$samp_id.all_vcfs.local/${OUT}.gz
+done
+cd intermediates/$samp_id.all_vcfs.local
+for j in `ls *gz`; do
+    bcftools index ${j}
+done
+cd ../..
+mkdir -p intermediates/$samp_id.all_var_tx_seqs 
+for i in `ls intermediates/$samp_id.exon_fas/*`; do
+    ENST=`echo ${i} | rev | cut -f 3,4 -d '.' | rev`;
+    for target_var in `grep ${ENST} intermediates/$samp_id.all_vcfs/*.vcf | cut -f 2- -d ':' | cut -f 1,2 | sed 's/\t/_/g'`; do
+        for vcf in `ls intermediates/$samp_id.all_vcfs.local/${target_var}*gz`; do
+            VCF_OUT=`echo ${vcf} | rev | cut -f 1 -d '/' | rev`;
+            bcftools consensus -s - -H A --mark-del X --mark-ins lc -f ${i} ${vcf} -o intermediates/$samp_id.all_var_tx_seqs/${ENST}_${VCF_OUT%.vcf*}.fa > logs/$samp_id.bcftools_consensus.log 2>&1;
+        done;
+    done;        
+done                                                                   
+# There's an annoying PAR_Y annotation that's causing issues.
+grep -v "ENST00000334651.11" intermediates/$samp_id.somatic_vars.tumor_cells.sfilt.snvs.somatic_txs > intermediates/$samp_id.filtd_txs 
+
+python scripts/lenstools/lenstools.py make-snv-peptides-context   -sv intermediates/$samp_id.somatic_vars.tumor_cells.sfilt.snvs.vcf  -g intermediates/$samp_id.sub_gtf   -st intermediates/$samp_id.filtd_txs  -vts intermediates/$samp_id.all_var_tx_seqs   --pep-ref refs/gencode.v37.pc_translations.fa   -o intermediates/$samp_id.snvs.mt_aa.fa   --nt-output /dev/null   -w /dev/null   --debug-output logs/$samp_id.make_snv_peptides_context.debug > /dev/null 2>&1
+echo "Running MHCflurry on SNV peptides..."
+python scripts/vcf_to_mtx.py intermediates/$samp_id.somatic_vars.tumor_cells.sfilt.snvs.vcf intermediates/$samp_id.snvs.tumor_cells.tsv > logs/$samp_id.vcf_to_mtx.log 2>&1
+mhcflurry-predict-scan intermediates/$samp_id.snvs.mt_aa.fa --no-throw --input-format fasta --results-all --models refs/mhcflurry/ --alleles ${hla_alleles} --out intermediates/$samp_id.snv.mhcflurry_outputs > logs/$samp_id.mhcflurry_snv.log 2>&1
+sed 's/,/	/g' intermediates/$samp_id.snv.mhcflurry_outputs  | cut -d '|' -f 7,8- | sed 's/|[0-9]\+	/	/g' | cut -f 1,3,7,8,11 > intermediates/${samp_id}.snv.mhcflurry_reduced
+
+head -1 intermediates/$samp_id.ctas_and_ervs.tumor_cells.bin.filtd.tsv | sed 's/\t/\n/g' | grep -v Hsap38 | grep -v barcode | sed 's/^/\\|/g' | sed 's/$/\\|/g' > intermediates/$samp_id.abundant_ctas
+head -1 intermediates/$samp_id.ctas_and_ervs.tumor_cells.bin.filtd.tsv | sed 's/\t/\n/g' | grep Hsap38 | grep -v barcode > intermediates/$samp_id.abundant_ervs
+echo "Extracting CTA protein sequences..."
+seqkit grep -r -f intermediates/$samp_id.abundant_ctas /tahp/refs/gencode.v37.pc_translations.fa > intermediates/$samp_id.ctas.fa 2> /dev/null
+#seqkit grep -r -f intermediates/$samp_id.abundant_ctas refs/gencode.v37.pc_translations.fa > intermediates/$samp_id.ctas.fa 2> /dev/null
+echo "Extracting ERV protein sequences..."
+#seqkit grep -r -f intermediates/$samp_id.abundant_ervs /tahp/refs/Hsap38.geve.aam_v1.fa > intermediates/$samp_id.ervs.fa 2> /dev/null
+seqkit grep -r -f intermediates/$samp_id.abundant_ervs refs/Hsap38.geve.aam_v1.fa > intermediates/$samp_id.ervs.fa 2> /dev/null
+echo "Running MHCflurry on CTA proteins..."
+mhcflurry-predict-scan intermediates/$samp_id.ctas.fa --no-throw --input-format fasta --results-all --models refs/mhcflurry/ --alleles ${hla_alleles} --out intermediates/$samp_id.cta.mhcflurry_outputs > logs/$samp_id.mhcflurry_cta.log 2>&1
+sed 's/,/	/g' intermediates/$samp_id.cta.mhcflurry_outputs  | cut -d '|' -f 7,8- | sed 's/|[0-9]\+	/	/g' | cut -f 1,3,7,8,11 > intermediates/${samp_id}.cta.mhcflurry_reduced
+echo "Running MHCflurry on ERV proteins..."
+mhcflurry-predict-scan intermediates/$samp_id.ervs.fa --no-throw --input-format fasta --results-all --models refs/mhcflurry/ --alleles ${hla_alleles} --out intermediates/$samp_id.erv.mhcflurry_outputs > logs/$samp_id.mhcflurry_erv.log 2>&1
+sed 's/,/	/g' intermediates/$samp_id.erv.mhcflurry_outputs  | cut -d '|' -f 7,8- | sed 's/|[0-9]\+	/	/g' | cut -f 1,3,7,8,11 > intermediates/${samp_id}.erv.mhcflurry_reduced
+
+rm -f intermediates/$samp_id.mhcflurry_reduced
+cat intermediates/*mhcflurry_reduced > intermediates/$samp_id.mhcflurry_reduced
+
+echo "Selecting best pMHC per antigen source per allele..."
+rm -f intermediates/$samp_id.targets_to_pmhcs.tsv
+for i in `cut -f 1 intermediates/$samp_id.mhcflurry_reduced | sort | uniq | sed 's/^/\^/g' | sed 's/$/	/g' | grep -v sequence_name`; do
+    OUT=`grep ${i} intermediates/$samp_id.mhcflurry_reduced | sort -n -k 3,5 | awk -v ba=$mhcflurry_ba '$3 < ba' | awk -v pres=$mhcflurry_presentation '$5 > pres' | head -1` # | grep -v -f <(zcat refs/peptides_blacklist.uniq.gz)`;
+    ID=`echo ${OUT} | cut -f 1 -d ' '`;
+    PEP=`echo ${OUT} | cut -f 2 -d ' '`;
+    BA=`echo ${OUT} | cut -f 3 -d ' ' | cut -f 1 -d '.'`;
+    ALLELE=`echo $OUT | cut -f 4 -d ' ' | sed 's/-/dash/g' | sed 's/\*/asterisk/g' | sed 's/:/colon/g'`;
+    PRES=`echo $OUT | cut -f 5 -d ' '`;
+    if [[ -n $PRES ]]; then
+        PRES100=$(awk "BEGIN {print $PRES * 100}");
+        echo "$ID	${ID}newline${PEP}newline${ALLELE}newlineAffinitycolon${BA}nMnewlinePresentationcolon$(printf "%.1f" "$PRES100" | sed -E 's/\.?0+$//')percent" >> intermediates/$samp_id.targets_to_pmhcs.tsv;
+    fi
+done
+
+grep -v -f <(zcat refs/peptides_blacklist.uniq.gz | sed 's/^	/newline/g' | sed 's/	$/newline/g') intermediates/$samp_id.targets_to_pmhcs.tsv > intermediates/$samp_id.targets_to_pmhcs.filtd.tsv
+
+csvtk transpose -t intermediates/$samp_id.ctas_and_ervs.tumor_cells.bin.filtd.tsv | head -1 > intermediates/$samp_id.find_replace.t.tsv
+while read old new; do
+    FNEW=`echo ${new} | sed 's/$/	/g'`;
+    FOLD=`echo ${old} | sed 's/$/	/g'`;
+    grep ${FOLD} <(csvtk transpose -t intermediates/$samp_id.ctas_and_ervs.tumor_cells.bin.filtd.tsv) | sed "s#${FOLD}#${FNEW}#g" >> intermediates/$samp_id.find_replace.t.tsv;
+done < intermediates/$samp_id.targets_to_pmhcs.filtd.tsv
+
+csvtk transpose -t intermediates/$samp_id.find_replace.t.tsv > intermediates/$samp_id.pmhcs.tsv
+head -1 intermediates/$samp_id.pmhcs.tsv > intermediates/$samp_id.pmhcs.sorted.tsv
+tail -n +2 intermediates/$samp_id.pmhcs.tsv | sort -k 1,1 >> intermediates/$samp_id.pmhcs.sorted.tsv
+
+if [ -n "$vcf" ]; then
+    csvtk transpose -t intermediates/$samp_id.snvs.tumor_cells.tsv | head -1 > intermediates/$samp_id.find_replace.t.tsv
+    while read old new; do
+        FNEW=`echo ${new} | sed 's/$/	/g'`;
+        FOLD=`echo ${old} | sed 's/$/	/g'`;
+        grep ${FOLD} <(csvtk transpose -t intermediates/$samp_id.snvs.tumor_cells.tsv) | sed "s#${FOLD}#${FNEW}#g" >> intermediates/$samp_id.find_replace.t.tsv;
+    done < intermediates/$samp_id.targets_to_pmhcs.filtd.tsv
+    csvtk transpose -t intermediates/$samp_id.find_replace.t.tsv | sed 's/NA/FALSE/g' > intermediates/$samp_id.snv_pmhcs.tsv
+    echo "Combining VCF matrix with CTA and/or ERV matrix..."
+    join --header -j 1 intermediates/$samp_id.pmhcs.sorted.tsv intermediates/$samp_id.snv_pmhcs.tsv | sed 's/ /	/g' | sed '1s/\.[0-9]\+\.[+-]\.M//g' | sed '1s/Hsap38/ERV/g' > intermediates/$samp_id.all_pmhcs.tsv
+else
+    cp intermediates/$samp_id.pmhcs.sorted.tsv $intermediates/$samp_id.all_pmhcs.tsv
+fi   
+
+
+#Rscript /tahp/scripts/tumor_antigen_coverage_cdf.pmhcs.R intermediates/$samp_id.pmhcs.tsv $samp_id > logs/$samp_id.cdf.pmhcs.log 2>&1
+Rscript scripts/tumor_antigen_coverage_cdf.pmhcs.R intermediates/$samp_id.all_pmhcs.tsv $samp_id > logs/$samp_id.cdf.pmhcs.log 2>&1
+
+sed 's/newline[a-zA-Z0-9\.]\+\t/\t/g' intermediates/$samp_id.all_pmhcs.tsv | sed 's/newline[a-zA-Z0-9\.]\+$//g' > intermediates/$samp_id.all_pmhcs.reduced.tsv
+
+echo "Creating igraph inputs..."
+#./tahp/scripts/prep_igraph_inputs.sh intermediates/$samp_id.ctas.bin.filtd.tsv $samp_id <(cat intermediates/$samp_id.cell_thresh_count) > logs/$samp_id.igraph_prep.log 2>&1
+scripts/prep_igraph_inputs.sh intermediates/$samp_id.all_pmhcs.reduced.tsv $samp_id <(cat intermediates/$samp_id.cell_thresh_count) > logs/$samp_id.igraph_prep.log 2>&1
+
+echo "Creating igraph plot..."
+#Rscript /tahp/scripts/make_igraph_plots.R $samp_id > logs/$samp_id.igraph.log 2>&1
+Rscript scripts/make_igraph_plots.R $samp_id > logs/$samp_id.igraph.log 2>&1
