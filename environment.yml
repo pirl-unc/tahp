@@ -20,4 +20,3 @@ dependencies:
   - conda-forge::seaborn
   - bioconda::snpeff=4.3.1t
   - bioconda::snpsift
-  - anaconda::git-lfs
