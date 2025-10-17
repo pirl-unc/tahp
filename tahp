@@ -30,6 +30,11 @@ for dir in intermediates plots logs outputs; do
     mkdir -p $dir
 done
 
+if [ ! -f refs/Homo_sapiens.assembly38.fa ]; then                                                   
+    echo "Downloading hg38 reference."                                                              
+    echo "This may take some time, but only runs once."                                             
+    wget https://storage.googleapis.com/genomics-public-data/resources/broad/hg38/v0/Homo_sapiens_assembly38.fasta -O refs/Homo_sapiens.assembly38.fa
+fi
 
 if [ "$FRESH_FLAG" = true ]; then
     echo "The -f flag was used, so clearing directories before running..."
